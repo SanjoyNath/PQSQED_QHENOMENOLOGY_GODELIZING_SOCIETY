@@ -1,0 +1,931 @@
+// robustdependencyanalyserpqsqed.cs
+// Combined single-file version (Blocks 1-5 merged)
+// Old CSC compatible: no string interpolation, no nullable types.
+// Option 3 substring model: token substrings + multi-token + full-name substrings.
+// Produces TXT/CSV reports and per-class ASCII tree files.
+
+using System;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace RobustDependencyAnalyzerPQSQED
+{
+    public static class Analyzer
+    {
+        // --------------------
+        // Configuration / Constants
+        // --------------------
+        public const int MinTokenSubstringLength = 2;
+        // Multipliers (as requested)
+        public const long DepthMultiplier = 1000000000000L; // 1e12
+        public const long DirectMultiplier = 10000L;
+        public const long FrequencyMultiplier = 100L;
+
+        // --------------------
+        // Global data
+        // --------------------
+        static List<string> AllSourceFiles = new List<string>();
+        static HashSet<string> AllClassFullNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        static HashSet<string> AllClassShortNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        static Dictionary<string, HashSet<string>> deps = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        static Dictionary<string, HashSet<string>> classSubstrings = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        static Dictionary<string, int> substringFrequency = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        static Dictionary<string, int> depthCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        // Basic types to ignore
+        static HashSet<string> BasicTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "int","int32","long","int64","short","int16","uint","uint32","ulong","uint64","ushort","uint16",
+            "byte","sbyte","float","single","double","decimal","bool","boolean","char","string","object","void",
+            "datetime","timespan","guid","task"
+        };
+
+        // --------------------
+        // Precompiled regexes
+        // --------------------
+        static readonly Regex NamespaceRegex = new Regex(@"\bnamespace\s+([A-Za-z0-9_.]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        static readonly Regex ClassDeclRegex = new Regex(@"\b(class|struct|interface)\s+([A-Za-z0-9_]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        static readonly Regex CsprojCompileRegex = new Regex("<Compile\\s+Include\\s*=\\s*\"([^\"]+)\"", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        static readonly Regex StringLiteralRegex = new Regex("\"(?:\\\\.|[^\\\\\"])*\"", RegexOptions.Compiled);
+        static readonly Regex SingleLineCommentRegex = new Regex(@"//.*?$", RegexOptions.Compiled | RegexOptions.Multiline);
+        static readonly Regex MultiLineCommentRegex = new Regex(@"/\*.*?\*/", RegexOptions.Compiled | RegexOptions.Singleline);
+
+        // splits on any non-identifier (keeps dots)
+        static readonly Regex TokenSplitRegex = new Regex("[^A-Za-z0-9_.]+", RegexOptions.Compiled);
+
+        // --------------------
+        // Main (entry)
+        // --------------------
+        public static int Main(string[] args)
+        {
+            try
+            {
+                // defaults
+                string rootFolder = AppDomain.CurrentDomain.BaseDirectory;
+                string outFolder = Path.Combine(rootFolder, "DependencyReports_Output");
+                string exeBase = "robustdependencyanalyserpqsqed";
+                int maxTreeDepth = -1;
+                bool allowGui = false;
+                string ext = ".cs";
+
+                // parse args
+                for (int i = 0; i < args.Length; i++)
+                {
+                    string a = args[i];
+                    if (a == null) continue;
+                    if (a.StartsWith("--root="))
+                    {
+                        string v = a.Substring(7).Trim('\"');
+                        if (Directory.Exists(v)) rootFolder = v;
+                    }
+                    else if (a.StartsWith("--out="))
+                    {
+                        string v = a.Substring(6).Trim('\"');
+                        outFolder = v;
+                    }
+                    else if (a.StartsWith("--max-depth="))
+                    {
+                        string v = a.Substring(12);
+                        int t;
+                        if (int.TryParse(v, out t)) maxTreeDepth = t;
+                    }
+                    else if (a == "--gui") allowGui = true;
+                    else if (a.StartsWith("--ext="))
+                    {
+                        string v = a.Substring(6);
+                        ext = v.StartsWith(".") ? v : "." + v;
+                    }
+                }
+
+                if (!Directory.Exists(rootFolder))
+                {
+                    Console.WriteLine("Root folder not found: " + rootFolder);
+                    return 1;
+                }
+
+                Console.WriteLine("Root folder: " + rootFolder);
+                Console.WriteLine("Output folder: " + outFolder);
+                Console.WriteLine("File extension: " + ext);
+
+                // gather source files (recursively, because your dataset is large)
+                Console.WriteLine("Gathering source files...");
+                AllSourceFiles.Clear();
+                try
+                {
+                    string[] files = Directory.GetFiles(rootFolder, "*" + ext, SearchOption.AllDirectories);
+                    for (int i = 0; i < files.Length; i++) AllSourceFiles.Add(Path.GetFullPath(files[i]));
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Failed to enumerate source files: " + ex.Message);
+                    return 2;
+                }
+                Console.WriteLine("Source files found: " + AllSourceFiles.Count);
+
+                if (AllSourceFiles.Count == 0)
+                {
+                    Console.WriteLine("No source files found. Exiting.");
+                    return 0;
+                }
+
+                // Parse csproj files in rootFolder top-level too (optional)
+                try
+                {
+                    string[] csprojs = Directory.GetFiles(rootFolder, "*.csproj", SearchOption.AllDirectories);
+                    for (int i = 0; i < csprojs.Length; i++)
+                    {
+                        List<string> projFiles = ParseCsprojForCompileIncludes(csprojs[i], Path.GetDirectoryName(csprojs[i]));
+                        for (int j = 0; j < projFiles.Count; j++)
+                        {
+                            string f = projFiles[j];
+                            if (File.Exists(f) && !AllSourceFiles.Contains(f))
+                                AllSourceFiles.Add(f);
+                        }
+                    }
+                }
+                catch { /* ignore */ }
+
+                // BLOCK 1: collect class names
+                Console.WriteLine("Collecting class names (first pass)...");
+                AllClassFullNames.Clear();
+                AllClassShortNames.Clear();
+                deps.Clear();
+                for (int i = 0; i < AllSourceFiles.Count; i++)
+                {
+                    ReadClassNamesFromFile(AllSourceFiles[i]);
+                    if ((i + 1) % 10000 == 0) Console.WriteLine("  processed files: " + (i + 1));
+                }
+                Console.WriteLine("All classes discovered: " + AllClassFullNames.Count);
+
+                // BLOCK 2: build substrings & frequencies
+                Console.WriteLine("Building per-class substrings and global substring frequencies...");
+                BuildClassSubstringsAndFrequencies();
+                Console.WriteLine("Unique substrings: " + substringFrequency.Count);
+
+                // BLOCK 3: parse dependencies
+                Console.WriteLine("Parsing dependencies (second pass)...");
+                ParseDependenciesInAllFiles(AllSourceFiles);
+
+                // compute depths (memoized)
+                Console.WriteLine("Computing dependency depths...");
+                depthCache.Clear();
+                List<string> depKeys = new List<string>(deps.Keys);
+                for (int i = 0; i < depKeys.Count; i++)
+                {
+                    ComputeDepth(depKeys[i], new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+                }
+
+                // BLOCK 4: write reports & trees
+                Console.WriteLine("Writing reports and per-class trees...");
+                OutputOptions options = new OutputOptions();
+                options.OutFolder = outFolder;
+                options.ExeBaseName = exeBase;
+                options.MaxTreeDepth = maxTreeDepth;
+                options.WriteAllTreesCombined = true;
+                WriteReportsAndTrees(options);
+
+                ShowGuiMessageIfRequested(allowGui, "Dependency analysis completed.", "Dependency Analyzer");
+                Console.WriteLine("Done.");
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Fatal error: " + ex.Message);
+                Console.WriteLine(ex.StackTrace);
+                return 99;
+            }
+        }
+
+        // --------------------
+        // Block 1 helpers — csproj parse, class collection, remove strings/comments
+        // --------------------
+        static List<string> ParseCsprojForCompileIncludes(string csprojPath, string folder)
+        {
+            List<string> results = new List<string>();
+            try
+            {
+                string projText = File.ReadAllText(csprojPath);
+                MatchCollection mc = CsprojCompileRegex.Matches(projText);
+                for (int i = 0; i < mc.Count; i++)
+                {
+                    string rel = mc[i].Groups[1].Value.Replace('\\', Path.DirectorySeparatorChar);
+                    string full = rel;
+                    if (!Path.IsPathRooted(full))
+                        full = Path.Combine(folder, rel);
+                    full = Path.GetFullPath(full);
+                    if (File.Exists(full))
+                        results.Add(full);
+                }
+            }
+            catch { }
+            return results;
+        }
+
+        static void ReadClassNamesFromFile(string path)
+        {
+            try
+            {
+                string text = File.ReadAllText(path);
+                string stripped = RemoveStringsAndComments(text);
+
+                // namespace
+                string fileNamespace = null;
+                Match mns = NamespaceRegex.Match(stripped);
+                if (mns.Success) fileNamespace = mns.Groups[1].Value.Trim();
+
+                MatchCollection mc = ClassDeclRegex.Matches(stripped);
+                if (mc.Count == 0)
+                {
+                    // fallback: filename as class
+                    string fname = Path.GetFileNameWithoutExtension(path);
+                    string full = (fileNamespace != null ? fileNamespace + "." + fname : fname);
+                    if (!AllClassFullNames.Contains(full)) AllClassFullNames.Add(full);
+                    if (!AllClassShortNames.Contains(fname)) AllClassShortNames.Add(fname);
+                    if (!deps.ContainsKey(full)) deps[full] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    return;
+                }
+
+                for (int i = 0; i < mc.Count; i++)
+                {
+                    string cname = mc[i].Groups[2].Value.Trim();
+                    string full = (fileNamespace != null ? fileNamespace + "." + cname : cname);
+                    if (!AllClassFullNames.Contains(full)) AllClassFullNames.Add(full);
+                    if (!AllClassShortNames.Contains(cname)) AllClassShortNames.Add(cname);
+                    if (!deps.ContainsKey(full)) deps[full] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("CollectClassNames error (" + path + "): " + ex.Message);
+            }
+        }
+
+        static string RemoveStringsAndComments(string src)
+        {
+            if (string.IsNullOrEmpty(src)) return src;
+            string step = StringLiteralRegex.Replace(src, "\"\"");
+            step = SingleLineCommentRegex.Replace(step, "");
+            step = MultiLineCommentRegex.Replace(step, "");
+            return step;
+        }
+
+        static void ShowGuiMessageIfRequested(bool allowGui, string message, string caption)
+        {
+            // WinForms optional. Kept empty to avoid extra deps.
+#if USE_WINFORMS
+            if (allowGui) { try { System.Windows.Forms.MessageBox.Show(message, caption); } catch { } }
+#endif
+        }
+
+        // --------------------
+        // Block 2 — Tokenizer & Option 3 substring generation
+        // --------------------
+        static void BuildClassSubstringsAndFrequencies()
+        {
+            try
+            {
+                classSubstrings.Clear();
+                List<string> all = new List<string>(AllClassFullNames);
+                all.Sort(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < all.Count; i++)
+                {
+                    string full = all[i];
+                    HashSet<string> subs = GenerateSubstringsForClass(full);
+                    classSubstrings[full] = subs;
+                }
+                BuildSubstringFrequencies();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("BuildClassSubstringsAndFrequencies error: " + ex.Message);
+            }
+        }
+
+        static HashSet<string> GenerateSubstringsForClass(string fullClassName)
+        {
+            HashSet<string> subs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrEmpty(fullClassName)) return subs;
+
+            // extract tokens
+            List<string> tokens = ExtractTokensFromFullName(fullClassName);
+
+            // substrings within tokens
+            for (int t = 0; t < tokens.Count; t++)
+            {
+                string tok = tokens[t];
+                if (string.IsNullOrEmpty(tok)) continue;
+                if (tok.Length >= MinTokenSubstringLength) subs.Add(tok);
+                for (int a = 0; a < tok.Length; a++)
+                {
+                    for (int b = a + MinTokenSubstringLength; b <= tok.Length; b++)
+                    {
+                        string s = tok.Substring(a, b - a);
+                        if (s.Length >= MinTokenSubstringLength) subs.Add(s);
+                    }
+                }
+            }
+
+            // concatenated adjacent tokens (multi-token sequences)
+            for (int start = 0; start < tokens.Count; start++)
+            {
+                StringBuilder combined = new StringBuilder();
+                for (int end = start; end < tokens.Count; end++)
+                {
+                    combined.Append(tokens[end]);
+                    string comb = combined.ToString();
+                    if (comb.Length >= MinTokenSubstringLength)
+                    {
+                        subs.Add(comb);
+                        for (int a = 0; a < comb.Length; a++)
+                        {
+                            for (int b = a + MinTokenSubstringLength; b <= comb.Length; b++)
+                            {
+                                string s = comb.Substring(a, b - a);
+                                if (s.Length >= MinTokenSubstringLength) subs.Add(s);
+                            }
+                        }
+                    }
+                    if (combined.Length > 200) break; // safety cap
+                }
+            }
+
+            // normalized full name (remove non-alphanum)
+            string normalized = Regex.Replace(fullClassName, "[^A-Za-z0-9]", "");
+            if (normalized.Length >= MinTokenSubstringLength)
+            {
+                subs.Add(normalized);
+                for (int a = 0; a < normalized.Length; a++)
+                {
+                    for (int b = a + MinTokenSubstringLength; b <= normalized.Length; b++)
+                    {
+                        string s = normalized.Substring(a, b - a);
+                        if (s.Length >= MinTokenSubstringLength) subs.Add(s);
+                    }
+                }
+            }
+
+            // dotted/underscore-removed substrings
+            string dottedRemoved = fullClassName.Replace('.', '_').Replace(' ', '_');
+            if (dottedRemoved.Length >= MinTokenSubstringLength)
+            {
+                for (int a = 0; a < dottedRemoved.Length; a++)
+                {
+                    for (int b = a + MinTokenSubstringLength; b <= dottedRemoved.Length; b++)
+                    {
+                        string s = dottedRemoved.Substring(a, b - a);
+                        if (s.Length >= MinTokenSubstringLength) subs.Add(s);
+                    }
+                }
+            }
+
+            // safety per-class cap
+            int cap = 200000;
+            if (subs.Count > cap)
+            {
+                List<string> allSubs = new List<string>(subs);
+                allSubs.Sort(delegate(string a, string b)
+                {
+                    if (a.Length != b.Length) return b.Length - a.Length;
+                    return string.Compare(a, b, StringComparison.OrdinalIgnoreCase);
+                });
+                HashSet<string> trimmed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < cap && i < allSubs.Count; i++) trimmed.Add(allSubs[i]);
+                subs = trimmed;
+            }
+
+            return subs;
+        }
+
+        static List<string> ExtractTokensFromFullName(string full)
+        {
+            List<string> outTokens = new List<string>();
+            if (string.IsNullOrEmpty(full)) return outTokens;
+
+            string[] parts = full.Split(new char[] { '.' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int p = 0; p < parts.Length; p++)
+            {
+                string part = parts[p];
+                if (string.IsNullOrEmpty(part)) continue;
+
+                string[] subparts = part.Split(new char[] { '_' }, StringSplitOptions.RemoveEmptyEntries);
+                for (int s = 0; s < subparts.Length; s++)
+                {
+                    string sp = subparts[s];
+                    if (sp.Length == 0) continue;
+                    List<string> camel = SplitCamelCase(sp);
+                    for (int c = 0; c < camel.Count; c++)
+                    {
+                        string tok = camel[c];
+                        if (tok.Length >= MinTokenSubstringLength) outTokens.Add(tok);
+                    }
+                    if (sp.Length >= MinTokenSubstringLength) outTokens.Add(sp);
+                }
+
+                string merged = part.Replace("_", "");
+                if (merged.Length >= MinTokenSubstringLength) outTokens.Add(merged);
+            }
+
+            // dedupe preserving order
+            List<string> uniq = new List<string>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < outTokens.Count; i++)
+            {
+                string t = outTokens[i];
+                if (!seen.Contains(t)) { seen.Add(t); uniq.Add(t); }
+            }
+            return uniq;
+        }
+
+        static List<string> SplitCamelCase(string s)
+        {
+            List<string> res = new List<string>();
+            if (string.IsNullOrEmpty(s)) return res;
+            int last = 0;
+            for (int i = 1; i < s.Length; i++)
+            {
+                char prev = s[i - 1];
+                char cur = s[i];
+                if (char.IsLower(prev) && char.IsUpper(cur))
+                {
+                    res.Add(s.Substring(last, i - last));
+                    last = i;
+                }
+                else if (char.IsDigit(prev) && char.IsLetter(cur))
+                {
+                    res.Add(s.Substring(last, i - last));
+                    last = i;
+                }
+                else if (char.IsLetter(prev) && char.IsDigit(cur))
+                {
+                    res.Add(s.Substring(last, i - last));
+                    last = i;
+                }
+            }
+            if (last < s.Length) res.Add(s.Substring(last, s.Length - last));
+            return res;
+        }
+
+        static void BuildSubstringFrequencies()
+        {
+            substringFrequency.Clear();
+            foreach (KeyValuePair<string, HashSet<string>> kv in classSubstrings)
+            {
+                foreach (string s in kv.Value)
+                {
+                    int old = 0;
+                    substringFrequency.TryGetValue(s, out old);
+                    substringFrequency[s] = old + 1;
+                }
+            }
+        }
+
+        // --------------------
+        // Block 3 — Dependency parsing & depth
+        // --------------------
+        static void ParseDependenciesInAllFiles(List<string> sourceFiles)
+        {
+            try
+            {
+                for (int i = 0; i < sourceFiles.Count; i++)
+                {
+                    ParseDependenciesInSingleFile(sourceFiles[i]);
+                    if ((i + 1) % 10000 == 0) Console.WriteLine("  parsed files: " + (i + 1));
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("ParseDependenciesInAllFiles error: " + ex.Message);
+            }
+        }
+
+        static void ParseDependenciesInSingleFile(string path)
+        {
+            try
+            {
+                string text = File.ReadAllText(path);
+                string stripped = RemoveStringsAndComments(text);
+
+                string fileNamespace = null;
+                Match mns = NamespaceRegex.Match(stripped);
+                if (mns.Success) fileNamespace = mns.Groups[1].Value.Trim();
+
+                MatchCollection mc = ClassDeclRegex.Matches(stripped);
+                List<string> declared = new List<string>();
+                if (mc.Count == 0)
+                {
+                    string fname = Path.GetFileNameWithoutExtension(path);
+                    string full = (fileNamespace != null ? fileNamespace + "." + fname : fname);
+                    declared.Add(full);
+                }
+                else
+                {
+                    for (int i = 0; i < mc.Count; i++)
+                    {
+                        string cname = mc[i].Groups[2].Value.Trim();
+                        string full = (fileNamespace != null ? fileNamespace + "." + cname : cname);
+                        declared.Add(full);
+                    }
+                }
+
+                ExtractDependencyTokens(stripped, declared);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("ParseDependenciesInSingleFile error (" + path + "): " + ex.Message);
+            }
+        }
+
+        static void ExtractDependencyTokens(string cleanedText, List<string> declared)
+        {
+            if (declared == null || declared.Count == 0) return;
+            string[] parts = TokenSplitRegex.Split(cleanedText);
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string token = parts[i];
+                if (string.IsNullOrEmpty(token)) continue;
+
+                // remove generics and array suffixes etc
+                token = Regex.Replace(token, "<[^>]*>", "");
+                token = token.Trim();
+                if (token.Length == 0) continue;
+
+                string shortName = token;
+                int dot = token.LastIndexOf('.');
+                if (dot >= 0) shortName = token.Substring(dot + 1);
+
+                if (BasicTypes.Contains(shortName)) continue;
+
+                bool known = false;
+                string matchedFull = null;
+
+                if (AllClassFullNames.Contains(token))
+                {
+                    known = true;
+                    matchedFull = token;
+                }
+                else if (AllClassShortNames.Contains(shortName))
+                {
+                    known = true;
+                    // find first full match
+                    foreach (string f in AllClassFullNames)
+                    {
+                        string fshort = f;
+                        int fd = f.LastIndexOf('.');
+                        if (fd >= 0) fshort = f.Substring(fd + 1);
+                        if (string.Equals(fshort, shortName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            matchedFull = f;
+                            break;
+                        }
+                    }
+                    if (matchedFull == null) matchedFull = shortName;
+                }
+
+                if (!known) continue;
+
+                for (int j = 0; j < declared.Count; j++)
+                {
+                    string owner = declared[j];
+                    if (!deps.ContainsKey(owner)) deps[owner] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    if (!string.Equals(owner, matchedFull, StringComparison.OrdinalIgnoreCase))
+                        deps[owner].Add(matchedFull);
+                }
+            }
+        }
+
+        static int ComputeDepth(string cname, HashSet<string> visiting)
+        {
+            int cached;
+            if (depthCache.TryGetValue(cname, out cached)) return cached;
+
+            if (!deps.ContainsKey(cname))
+            {
+                depthCache[cname] = 0;
+                return 0;
+            }
+
+            if (visiting.Contains(cname))
+            {
+                depthCache[cname] = 0;
+                return 0;
+            }
+
+            visiting.Add(cname);
+            int max = 0;
+            foreach (string d in deps[cname])
+            {
+                if (string.Equals(d, cname, StringComparison.OrdinalIgnoreCase)) continue;
+                int child = ComputeDepth(d, visiting);
+                if (child > max) max = child;
+            }
+            visiting.Remove(cname);
+
+            depthCache[cname] = (deps[cname].Count == 0 ? 0 : max + 1);
+            return depthCache[cname];
+        }
+
+        // --------------------
+        // Block 4 — Reports + ASCII trees
+        // --------------------
+        public class OutputOptions
+        {
+            public string OutFolder;
+            public string ExeBaseName = "robustdependencyanalyserpqsqed";
+            public int MaxTreeDepth = -1; // -1 unlimited
+            public bool WriteAllTreesCombined = true;
+        }
+
+        class RankItem
+        {
+            public string ClassName;
+            public int Depth;
+            public long FrequencyScore;
+            public long SharedSubstrings;
+            public long RankScore;
+            public int Rank;
+            public int DirectDependencyCount;
+        }
+
+        static void WriteReportsAndTrees(OutputOptions options)
+        {
+            if (options == null) options = new OutputOptions();
+            string outFolder = options.OutFolder ?? AppDomain.CurrentDomain.BaseDirectory;
+            if (!Directory.Exists(outFolder)) Directory.CreateDirectory(outFolder);
+
+            try
+            {
+                // compute frequency score per class
+                Dictionary<string, long> frequencyScore = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+                foreach (KeyValuePair<string, HashSet<string>> kv in classSubstrings)
+                {
+                    string cname = kv.Key;
+                    long sum = 0;
+                    foreach (string sub in kv.Value)
+                    {
+                        int freq = 0;
+                        if (substringFrequency.TryGetValue(sub, out freq)) sum += (long)freq;
+                    }
+                    frequencyScore[cname] = sum;
+                }
+
+                // ensure referenced classes present
+                HashSet<string> allReferenced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (KeyValuePair<string, HashSet<string>> kv in deps)
+                    foreach (string d in kv.Value) allReferenced.Add(d);
+                foreach (string r in allReferenced)
+                {
+                    if (!AllClassFullNames.Contains(r)) AllClassFullNames.Add(r);
+                    if (!classSubstrings.ContainsKey(r)) classSubstrings[r] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    if (!frequencyScore.ContainsKey(r)) frequencyScore[r] = 0L;
+                    if (!deps.ContainsKey(r)) deps[r] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                }
+
+                // shared substrings count
+                Dictionary<string, long> sharedSubstringsCount = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+                foreach (KeyValuePair<string, HashSet<string>> kv in classSubstrings)
+                {
+                    string cname = kv.Key;
+                    long sumShared = 0;
+                    foreach (string sub in kv.Value)
+                    {
+                        int freq = 0;
+                        if (substringFrequency.TryGetValue(sub, out freq))
+                        {
+                            int others = freq - 1;
+                            if (others > 0) sumShared += (long)others;
+                        }
+                    }
+                    sharedSubstringsCount[cname] = sumShared;
+                }
+
+                // compute depths if not present
+                foreach (string r in AllClassFullNames)
+                {
+                    if (!depthCache.ContainsKey(r))
+                        ComputeDepth(r, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+                }
+
+                // prepare rank items
+                List<RankItem> rankItems = new List<RankItem>();
+                foreach (string cname in AllClassFullNames)
+                {
+                    RankItem ri = new RankItem();
+                    ri.ClassName = cname;
+                    ri.Depth = depthCache.ContainsKey(cname) ? depthCache[cname] : 0;
+                    ri.FrequencyScore = frequencyScore.ContainsKey(cname) ? frequencyScore[cname] : 0L;
+                    ri.SharedSubstrings = sharedSubstringsCount.ContainsKey(cname) ? sharedSubstringsCount[cname] : 0L;
+                    ri.DirectDependencyCount = deps.ContainsKey(cname) ? deps[cname].Count : 0;
+                    ri.RankScore = ri.Depth * DepthMultiplier + (long)ri.DirectDependencyCount * DirectMultiplier + ri.FrequencyScore * FrequencyMultiplier + ri.SharedSubstrings;
+                    rankItems.Add(ri);
+                }
+
+                // sort
+                rankItems.Sort(delegate(RankItem a, RankItem b)
+                {
+                    int cmp = 0;
+                    if (a.RankScore > b.RankScore) cmp = -1;
+                    else if (a.RankScore < b.RankScore) cmp = 1;
+                    else
+                    {
+                        if (a.DirectDependencyCount > b.DirectDependencyCount) cmp = -1;
+                        else if (a.DirectDependencyCount < b.DirectDependencyCount) cmp = 1;
+                        else
+                        {
+                            if (a.FrequencyScore > b.FrequencyScore) cmp = -1;
+                            else if (a.FrequencyScore < b.FrequencyScore) cmp = 1;
+                            else cmp = string.Compare(a.ClassName, b.ClassName, StringComparison.OrdinalIgnoreCase);
+                        }
+                    }
+                    return cmp;
+                });
+
+                // assign rank
+                for (int i = 0; i < rankItems.Count; i++) rankItems[i].Rank = i + 1;
+
+                string timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+                string txtPath = Path.Combine(outFolder, options.ExeBaseName + "_DependencyReport_" + timestamp + ".txt");
+                string csvPath = Path.Combine(outFolder, options.ExeBaseName + "_DependencyReport_" + timestamp + ".csv");
+
+                using (StreamWriter sw = new StreamWriter(txtPath, false, Encoding.UTF8))
+                {
+                    sw.WriteLine("=== DEPENDENCY CHAIN ANALYSIS WITH DEEP FREQUENCY METRICS ===");
+                    sw.WriteLine("Generated: " + DateTime.Now.ToString());
+                    sw.WriteLine("Source classes: " + AllClassFullNames.Count);
+                    sw.WriteLine();
+
+                    sw.WriteLine(string.Format("{0,-80} {1,7} {2,15} {3,18} {4,8} {5,16} {6,6}",
+                        "CLASS", "DEPTH", "FREQUENCY", "SHARED_SUBSTR", "DIRECT", "RANKSCORE", "RANK"));
+                    sw.WriteLine(new string('-', 160));
+
+                    for (int i = 0; i < rankItems.Count; i++)
+                    {
+                        RankItem ri = rankItems[i];
+                        sw.WriteLine(string.Format("{0,-80} {1,7} {2,15} {3,18} {4,8} {5,16} {6,6}",
+                            ri.ClassName, ri.Depth, ri.FrequencyScore, ri.SharedSubstrings, ri.DirectDependencyCount, ri.RankScore, ri.Rank));
+                    }
+
+                    sw.WriteLine();
+                    sw.WriteLine("=== DETAILED DEPENDENCIES ===");
+                    sw.WriteLine();
+
+                    for (int i = 0; i < rankItems.Count; i++)
+                    {
+                        RankItem ri = rankItems[i];
+                        sw.WriteLine("[" + ri.ClassName + "]");
+                        sw.WriteLine("Depth: " + ri.Depth);
+                        sw.WriteLine("DirectDependencyCount: " + ri.DirectDependencyCount);
+                        sw.WriteLine("FrequencyScore: " + ri.FrequencyScore);
+                        sw.WriteLine("SharedSubstringsCount: " + ri.SharedSubstrings);
+                        sw.WriteLine("RankScore: " + ri.RankScore);
+                        sw.WriteLine("Rank: " + ri.Rank);
+                        sw.WriteLine("Direct dependencies (" + ri.DirectDependencyCount + "):");
+                        if (deps.ContainsKey(ri.ClassName) && deps[ri.ClassName].Count > 0)
+                        {
+                            List<string> dl = new List<string>(deps[ri.ClassName]); dl.Sort(StringComparer.OrdinalIgnoreCase);
+                            for (int j = 0; j < dl.Count; j++) sw.WriteLine("  - " + dl[j]);
+                        }
+                        else sw.WriteLine("  (none)");
+
+                        sw.WriteLine("Substrings present (" + (classSubstrings.ContainsKey(ri.ClassName) ? classSubstrings[ri.ClassName].Count : 0) + "):");
+                        if (classSubstrings.ContainsKey(ri.ClassName) && classSubstrings[ri.ClassName].Count > 0)
+                        {
+                            List<string> sl = new List<string>(classSubstrings[ri.ClassName]); sl.Sort(StringComparer.OrdinalIgnoreCase);
+                            for (int j = 0; j < sl.Count; j++) sw.WriteLine("  * " + sl[j] + " (freq=" + substringFrequency[sl[j]] + ")");
+                        }
+                        sw.WriteLine();
+                    }
+                }
+
+                using (StreamWriter sw = new StreamWriter(csvPath, false, Encoding.UTF8))
+                {
+                    sw.WriteLine("Class,Depth,FrequencyScore,SharedSubstringsCount,DirectCount,RankScore,Rank,DirectDependencies,Substrings");
+                    for (int i = 0; i < rankItems.Count; i++)
+                    {
+                        RankItem ri = rankItems[i];
+                        string directJoined = "";
+                        if (deps.ContainsKey(ri.ClassName) && deps[ri.ClassName].Count > 0)
+                        {
+                            List<string> dl = new List<string>(deps[ri.ClassName]); dl.Sort(StringComparer.OrdinalIgnoreCase);
+                            directJoined = string.Join(";", dl.ToArray());
+                        }
+                        string substrJoined = "";
+                        if (classSubstrings.ContainsKey(ri.ClassName) && classSubstrings[ri.ClassName].Count > 0)
+                        {
+                            List<string> sl = new List<string>(classSubstrings[ri.ClassName]); sl.Sort(StringComparer.OrdinalIgnoreCase);
+                            substrJoined = string.Join(";", sl.ToArray());
+                        }
+
+                        sw.WriteLine("\"" + ri.ClassName + "\"," + ri.Depth + "," + ri.FrequencyScore + "," + ri.SharedSubstrings + "," + ri.DirectDependencyCount + "," + ri.RankScore + "," + ri.Rank + "," + "\"" + EscapeCsv(directJoined) + "\"," + "\"" + EscapeCsv(substrJoined) + "\"");
+                    }
+                }
+
+                Console.WriteLine("Report written:\n  " + txtPath + "\n  " + csvPath);
+
+                // per-class trees folder
+                string treesFolderName = options.ExeBaseName + "_DependencyTrees_" + timestamp;
+                string treesFolder = Path.Combine(outFolder, treesFolderName);
+                if (!Directory.Exists(treesFolder)) Directory.CreateDirectory(treesFolder);
+
+                string combinedTreesPath = Path.Combine(treesFolder, "all_trees_" + timestamp + ".txt");
+                StreamWriter combinedWriter = null;
+                if (options.WriteAllTreesCombined)
+                {
+                    combinedWriter = new StreamWriter(combinedTreesPath, false, Encoding.UTF8);
+                }
+
+                for (int i = 0; i < rankItems.Count; i++)
+                {
+                    string root = rankItems[i].ClassName;
+                    string fname = SanitizeFileName(root) + "_tree.txt";
+                    string fpath = Path.Combine(treesFolder, fname);
+                    try
+                    {
+                        List<string> lines = BuildAsciiTreeLines(root, options.MaxTreeDepth);
+                        File.WriteAllLines(fpath, lines, Encoding.UTF8);
+                        if (combinedWriter != null)
+                        {
+                            combinedWriter.WriteLine("== " + root + " ==");
+                            for (int L = 0; L < lines.Count; L++) combinedWriter.WriteLine(lines[L]);
+                            combinedWriter.WriteLine();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("Failed to write tree for " + root + ": " + ex.Message);
+                    }
+                }
+
+                if (combinedWriter != null) { combinedWriter.Flush(); combinedWriter.Close(); Console.WriteLine("Combined trees written to: " + combinedTreesPath); }
+
+                Console.WriteLine("Per-class ASCII dependency trees written to folder: " + treesFolder);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("WriteReportsAndTrees error: " + ex.Message);
+            }
+        }
+
+        static List<string> BuildAsciiTreeLines(string root, int maxDepth)
+        {
+            List<string> outLines = new List<string>();
+            outLines.Add(root);
+            HashSet<string> visiting = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            visiting.Add(root);
+
+            List<string> children = deps.ContainsKey(root) ? new List<string>(deps[root]) : new List<string>();
+            children.Sort(StringComparer.OrdinalIgnoreCase);
+
+            for (int i = 0; i < children.Count; i++)
+            {
+                bool last = (i == children.Count - 1);
+                BuildAsciiSubtree(children[i], "", last, visiting, outLines, 1, maxDepth);
+            }
+
+            return outLines;
+        }
+
+        static void BuildAsciiSubtree(string node, string prefix, bool isLast, HashSet<string> visiting, List<string> outLines, int level, int maxDepth)
+        {
+            string branch = isLast ? "└─ " : "├─ ";
+            bool cycle = visiting.Contains(node);
+            outLines.Add(prefix + branch + node + (cycle ? "  <-- CYCLE" : ""));
+
+            if (cycle) return;
+            if (maxDepth >= 0 && level > maxDepth) return;
+
+            visiting.Add(node);
+            List<string> children = deps.ContainsKey(node) ? new List<string>(deps[node]) : new List<string>();
+            children.Sort(StringComparer.OrdinalIgnoreCase);
+
+            for (int i = 0; i < children.Count; i++)
+            {
+                bool last = (i == children.Count - 1);
+                string childPrefix = prefix + (isLast ? "   " : "│  ");
+                BuildAsciiSubtree(children[i], childPrefix, last, visiting, outLines, level + 1, maxDepth);
+            }
+
+            visiting.Remove(node);
+        }
+
+        static string SanitizeFileName(string name)
+        {
+            string n = name;
+            foreach (char c in Path.GetInvalidFileNameChars()) n = n.Replace(c, '_');
+            n = n.Replace(':', '_');
+            n = n.Replace(' ', '_');
+            return n;
+        }
+
+        static string EscapeCsv(string s)
+        {
+            if (s == null) return "";
+            return s.Replace("\"", "\"\"");
+        }
+    }
+}
