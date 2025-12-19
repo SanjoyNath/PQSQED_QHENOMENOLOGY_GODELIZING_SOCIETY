@@ -1,0 +1,97 @@
+@echo off
+setlocal enabledelayedexpansion
+
+echo ============================================
+echo   ROBUST DEPENDENCY ANALYSER BUILD SYSTEM
+echo ============================================
+echo.
+
+rem --------------------------------------------------
+rem 1) FIND THE .CS FILE AUTOMATICALLY (only one)
+rem --------------------------------------------------
+set CSFILE=
+for %%F in (*.cs) do (
+    if not defined CSFILE (
+        set CSFILE=%%F
+    )
+)
+
+if not defined CSFILE (
+    echo ERROR: No .cs file found in this folder.
+    pause
+    exit /b 1
+)
+
+echo Found source file: %CSFILE%
+
+rem --------------------------------------------------
+rem 2) DETERMINE EXE NAME FROM CS FILE
+rem --------------------------------------------------
+set EXEFILE=%CSFILE:.cs=.exe%
+echo Output EXE will be: %EXEFILE%
+echo.
+
+rem --------------------------------------------------
+rem 3) CLEAN OLD EXE
+rem --------------------------------------------------
+if exist "%EXEFILE%" (
+    echo Removing old executable...
+    del "%EXEFILE%"
+)
+
+rem --------------------------------------------------
+rem 4) COMPILE USING OLD CSC (Framework)
+rem     You may adjust path if your CSC is elsewhere.
+rem --------------------------------------------------
+echo.
+echo Compiling with CSC...
+echo.
+
+rem Try system CSC first (Framework 4.0 – 4.8)
+where csc >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo WARNING: CSC not found in PATH. Trying fallback...
+    if exist "%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe" (
+        set CSC="%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe"
+    ) else (
+        echo ERROR: Could not locate csc.exe
+        pause
+        exit /b 1
+    )
+) else (
+    set CSC=csc
+)
+
+%CSC% /nologo /t:exe /out:"%EXEFILE%" "%CSFILE%"
+if %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo ============================================
+    echo   BUILD FAILED — Fix errors above
+    echo ============================================
+    echo.
+    pause
+    exit /b 1
+)
+
+echo.
+echo ============================================
+echo        BUILD SUCCESSFUL!
+echo ============================================
+echo EXE created: %EXEFILE%
+echo.
+
+rem --------------------------------------------------
+rem 5) RUN THE ANALYZER
+rem --------------------------------------------------
+echo Running dependency analyzer...
+echo.
+
+"%EXEFILE%"
+
+echo.
+echo ============================================
+echo        ANALYSIS COMPLETE
+echo ============================================
+echo.
+pause
+exit /b 0
